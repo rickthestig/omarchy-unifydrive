@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.aihub/
+.aihubignore
+AI_CONTEXT.md
+*.bak
+*.pre-hub*

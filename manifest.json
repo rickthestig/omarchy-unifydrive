@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "eg.unifydrive",
+  "name": "UnifyDrive",
+  "version": "0.5.0",
+  "author": "eg",
+  "license": "MIT",
+  "description": "Browse, upload and download files, stream music and video, read comics, browse photos, sync folders, share links, NAS transfers/apps/health alerts, quick capture, autoplay, and save albums/chapters/videos offline on a UnifyDrive UT2 via the ud.link web API.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "UnifyDrive",
+    "description": "Browse a UnifyDrive UT2 and upload/download files.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "rootPath": "/nvme11/my/data", "downloadDir": "~/Downloads", "comicsPath": "/nvme11/my/data/Comics" },
+    "schema": [
+      { "key": "rootPath", "type": "string", "label": "Start folder", "defaultValue": "/nvme11/my/data" },
+      { "key": "downloadDir", "type": "string", "label": "Download folder", "defaultValue": "~/Downloads" },
+      { "key": "comicsPath", "type": "string", "label": "Comics folder (.cbz chapters, one folder per series)", "defaultValue": "/nvme11/my/data/Comics" }
+    ]
+  }
+}
