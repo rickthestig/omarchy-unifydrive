@@ -21,6 +21,13 @@ python3 ~/.config/omarchy/plugins/eg.unifydrive/udrive.py logout --forget
 omarchy plugin remove eg.unifydrive --yes
 ```
 
+<table>
+<tr>
+<td width="50%"><img src="preview.png" alt="Files tab: folder list with share buttons and free space" width="100%"></td>
+<td width="50%"><img src="docs/settings.png" alt="More tab, Settings: agent, photo sync, alerts and autoplay" width="100%"></td>
+</tr>
+</table>
+
 ## What it does
 
 - **Files**: browse, upload (files, folders, drag and drop), download, delete to the recycle bin, share links (copied with the password).
