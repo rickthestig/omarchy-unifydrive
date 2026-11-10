@@ -12,7 +12,7 @@ Usage:
   udrive.py logout [--forget]   (end the session; --forget also wipes saved credentials)
   udrive.py stream-url <remote_file>   (resolve a ranged/HLS stream URL)
   udrive.py play <remote_file> [mpv args]
-  udrive.py albums-all [--refresh] | cover-proxy | albums [page] | songs <album_id> | play-album <album_id> [start]
+  udrive.py albums-all [--refresh] | cover-proxy | audio-proxy (the daemon behind lossless music) | albums [page] | songs <album_id> | play-album <album_id> [start]
   udrive.py player pause|next|prev|stop|status|volume:N|jump:N|seek:S
   udrive.py vplayer status|pause|stop|seek:S|skip:±S|sid:N|aid:N   |   video-progress [remote_path...]
     udrive.py continue                    (what to pick up again: video / comic / album, local data only)
@@ -668,8 +668,14 @@ def _get_json(d, endpoint, params):
 
 
 def resolve_stream(d, path):
-    """Ask the UT2 for a streamable URL: ranged progressive MP4 for video, an HLS playlist for audio."""
+    """Ask the UT2 for a streamable URL: the original file over ranged HTTP for video and audio (audio falls back to an
+    HLS transcode, and UD_AUDIO_TRANSCODE=1 / UD_VIDEO_TRANSCODE=1 ask for the transcodes)."""
     kind = _kind(path)
+    if kind == "audio" and not os.environ.get("UD_AUDIO_TRANSCODE"):
+        # The original file (a FLAC stays FLAC) through the local audio proxy; the HLS transcode below is the fallback.
+        url = audio_direct_url(path)
+        if url:
+            return {"url": url, "kind": kind, "duration": None, "title": os.path.basename(path)}
     if kind == "video" and not os.environ.get("UD_VIDEO_TRANSCODE"):
         # The original file, over ranged HTTP: keeps every audio and subtitle track (the server's transcode /splay
         # copy silently drops text subtitles). Set UD_VIDEO_TRANSCODE=1 for the lighter transcoded stream instead.
@@ -2125,6 +2131,173 @@ def range_server(d, path, size, name):
     return f"http://127.0.0.1:{srv.server_address[1]}/{token}/{up.quote(name)}"
 
 
+# --------------------------------------------------------------------------
+# Music: the original file through a local range proxy (a FLAC stays a FLAC)
+# --------------------------------------------------------------------------
+# Audio used to play only the server's HLS transcode (lossy AAC, ~350 kbps) whatever the file was. The original is
+# served the way video's is: the relay answers open-ended Range requests with 200, which breaks seeking, so a
+# localhost daemon turns them into proper 206s and reads ahead over several connections. One daemon serves every
+# track of every album and exits after UD_AUDIO_PROXY_IDLE seconds (default 30 min) with nothing playing.
+# UD_AUDIO_TRANSCODE=1 brings the old behaviour back, and any failure to start the daemon falls back to it.
+AUDIO_PROXY_STATE = os.path.join(_runtime(), "unifydrive-audio-proxy.json")
+
+
+def audio_proxy():
+    """The daemon (`udrive.py audio-proxy`): prints one JSON line {port, token}, then serves until idle."""
+    import collections, http.server, secrets, socketserver
+    from concurrent.futures import ThreadPoolExecutor
+    d = Drive()
+    token = secrets.token_urlsafe(12)
+    pool = ThreadPoolExecutor(int(os.environ.get("UD_AUDIO_WORKERS", "16")))
+    CH, AHEAD = 1 << 18, int(os.environ.get("UD_AUDIO_AHEAD", "32"))
+    idle = int(os.environ.get("UD_AUDIO_PROXY_IDLE", "1800"))
+    sizes, lock, st = {}, threading.Lock(), {"busy": 0, "last": time.time()}
+
+    def size_of(path):
+        with lock:
+            if path in sizes:
+                return sizes[path]
+        n = _resilient(d, file_size, d, path)
+        with lock:
+            sizes[path] = n
+        return n
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _serve(self, body):
+            with lock:
+                st["busy"] += 1
+            try:
+                self._serve_one(body)
+            finally:
+                with lock:
+                    st["busy"] -= 1
+                    st["last"] = time.time()
+
+        def _serve_one(self, body):
+            m = re.match(r"^/%s(/.+)$" % re.escape(token), up.urlsplit(self.path).path)
+            remote = up.unquote(m.group(1)) if m else ""
+            if not remote.startswith("/") or ".." in remote.split("/") or remote.lower().rsplit(".", 1)[-1] not in AUDIO_EXT:
+                self.send_error(404)
+                return
+            try:
+                size = size_of(remote)
+            except Exception:
+                self.send_error(502)
+                return
+            a, b, ranged = 0, size - 1, False
+            mr = re.match(r"bytes=(\d*)-(\d*)$", (self.headers.get("Range") or "").strip())
+            if mr:
+                ranged = True
+                lo, hi = mr.groups()
+                if lo == "":
+                    a = max(0, size - int(hi or 0))
+                else:
+                    a = int(lo)
+                    b = min(int(hi), size - 1) if hi else size - 1
+            if a >= size or a > b:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(206 if ranged else 200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(b - a + 1))
+            if ranged:
+                self.send_header("Content-Range", f"bytes {a}-{b}/{size}")
+            self.end_headers()
+            if not body:
+                return
+            futs, nxt = collections.deque(), a
+
+            def submit():
+                nonlocal nxt
+                e = min(nxt + CH - 1, b)
+                futs.append(pool.submit(_resilient, d, d.read_range, remote, nxt, e, size))
+                nxt = e + 1
+
+            try:
+                while len(futs) < AHEAD and nxt <= b:
+                    submit()
+                while futs:
+                    self.wfile.write(futs.popleft().result())
+                    if nxt <= b:
+                        submit()
+            except (BrokenPipeError, ConnectionResetError):
+                pass            # mpv seeked or quit
+            except Exception:
+                self.close_connection = True   # upstream died mid-body: drop the connection, mpv reconnects
+            finally:
+                for f in futs:
+                    f.cancel()
+
+        def do_GET(self):
+            self._serve(True)
+
+        def do_HEAD(self):
+            self._serve(False)
+
+    class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    def reaper():
+        while True:
+            time.sleep(min(30, max(1, idle // 4)))
+            with lock:
+                quiet = st["busy"] == 0 and time.time() - st["last"] > idle
+            if quiet:
+                try:
+                    if json.load(open(AUDIO_PROXY_STATE)).get("pid") == os.getpid():
+                        os.remove(AUDIO_PROXY_STATE)
+                except (OSError, ValueError):
+                    pass
+                os._exit(0)
+
+    srv = S(("127.0.0.1", 0), H)
+    threading.Thread(target=reaper, daemon=True).start()
+    print(json.dumps({"port": srv.server_address[1], "token": token}), flush=True)
+    srv.serve_forever()
+
+
+def _audio_proxy_ensure():
+    """The running audio proxy's {port, token}, starting it if needed; None if it cannot be started."""
+    import fcntl, select, socket
+    with open(AUDIO_PROXY_STATE + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)          # several tracks resolve at once: only one starts the daemon
+        try:
+            st = json.load(open(AUDIO_PROXY_STATE))
+            socket.create_connection(("127.0.0.1", int(st["port"])), timeout=1).close()
+            return st
+        except Exception:
+            pass
+        p = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "audio-proxy"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        if not select.select([p.stdout], [], [], 12)[0]:
+            p.kill()
+            return None
+        st = json.loads(p.stdout.readline())
+        st["pid"] = p.pid
+        fd = os.open(AUDIO_PROXY_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(st, f)
+        return st
+
+
+def audio_direct_url(path):
+    """mpv's URL for the original audio file, or None to fall back to the HLS transcode."""
+    try:
+        st = _audio_proxy_ensure()
+        return f"http://127.0.0.1:{st['port']}/{st['token']}{up.quote(path, safe='/')}" if st else None
+    except Exception:
+        return None
+
+
 VSOCK = os.path.join(_runtime(), "unifydrive-video.sock")
 VIDEO_PROGRESS = os.path.expanduser("~/.config/unifydrive/video.json")
 SUB_EXT = (".srt", ".ass", ".ssa", ".vtt", ".sub")
@@ -2841,6 +3014,9 @@ def main(a):
         return
     if cmd == "cover-proxy":
         cover_proxy()
+        return
+    if cmd == "audio-proxy":
+        audio_proxy()
         return
     if cmd == "comic-progress":
         print(json.dumps(comic_progress(a[1:])))
