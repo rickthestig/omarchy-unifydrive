@@ -14,6 +14,13 @@ omarchy plugin add https://github.com/rickthestig/omarchy-unifydrive.git --enabl
 omarchy plugin update eg.unifydrive --yes && omarchy restart shell
 ```
 
+**Remove** it (the first line also wipes your saved credentials from the keyring; skip it to keep them):
+
+```bash
+python3 ~/.config/omarchy/plugins/eg.unifydrive/udrive.py logout --forget
+omarchy plugin remove eg.unifydrive --yes
+```
+
 ## What it does
 
 - **Files**: browse, upload (files, folders, drag and drop), download, delete to the recycle bin, share links (copied with the password).
