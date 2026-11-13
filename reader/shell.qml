@@ -344,12 +344,12 @@ ShellRoot {
             anchors.horizontalCenter: parent.horizontalCenter
             y: 14
             spacing: 2
-            Text {
+            Text { textFormat: Text.PlainText;
               anchors.horizontalCenter: parent.horizontalCenter
               text: app.chapters[model.ch] ? app.chapters[model.ch].label : ""
               color: app.fg; font.pixelSize: 20; font.bold: true
             }
-            Text {
+            Text { textFormat: Text.PlainText;
               anchors.horizontalCenter: parent.horizontalCenter
               text: (app.chapters[model.ch] && app.chapters[model.ch].group ? app.chapters[model.ch].group + "  ·  " : "") + model.total + " pages"
               color: app.dim; font.pixelSize: 12
@@ -382,7 +382,7 @@ ShellRoot {
             color: "#181818"
             Text { anchors.centerIn: parent; text: img.status === Image.Error ? "Could not decode this page" : "…"; color: app.dim; font.pixelSize: 14 }
           }
-          Text {
+          Text { textFormat: Text.PlainText;
             visible: model.err !== ""
             x: 0; y: row.bandH; width: row.width; height: row.imgH
             horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
@@ -406,7 +406,7 @@ ShellRoot {
         }
       }
 
-      Text {
+      Text { textFormat: Text.PlainText;
         anchors.centerIn: parent
         visible: pages.count === 0
         horizontalAlignment: Text.AlignHCenter

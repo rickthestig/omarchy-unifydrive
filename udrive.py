@@ -10,7 +10,7 @@ Usage:
   udrive.py check
   udrive.py login [--auto] [--forget]   (--auto: saved credentials only, no prompts)
   udrive.py logout [--forget]   (end the session; --forget also wipes saved credentials)
-  udrive.py stream-url <remote_file>   (resolve a ranged/HLS stream URL)
+  udrive.py stream-url <remote_file>   (resolve a stream URL: the localhost proxy's, or the NAS's own for video)
   udrive.py play <remote_file> [mpv args]
   udrive.py albums-all [--refresh] | cover-proxy | audio-proxy (the daemon behind lossless music) | albums [page] | songs <album_id> | play-album <album_id> [start]
   udrive.py player pause|next|prev|stop|status|volume:N|jump:N|seek:S
@@ -38,11 +38,28 @@ Usage:
 All commands print JSON on stdout. The session lives in
 ~/.config/unifydrive/session.json (mode 600).
 """
-import base64, hashlib, http.client, io, json, os, re, shutil, struct, subprocess, sys, threading, time, random, uuid as uuidlib, zipfile, zlib
+import base64, hashlib, http.client, io, json, mimetypes, os, re, shutil, stat, struct, subprocess, sys, threading, time, random, uuid as uuidlib, zipfile, zlib
 import urllib.error, urllib.parse as up, urllib.request as ur
 
 SESSION = os.path.expanduser("~/.config/unifydrive/session.json")
 CHUNK = 2 * 1024 * 1024
+
+
+class _SameOriginRedirect(ur.HTTPRedirectHandler):
+    """The NAS session cookie is an ordinary request header, and urllib re-sends those on a redirect to ANY host (and
+    from https to http). Follow redirects only within the same origin; the API never needs a cross-origin one."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        a, b = up.urlsplit(req.full_url), up.urlsplit(up.urljoin(req.full_url, newurl))
+        if (a.scheme, a.netloc.lower()) != (b.scheme, b.netloc.lower()):
+            raise urllib.error.HTTPError(req.full_url, code, "cross-origin redirect refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = ur.build_opener(_SameOriginRedirect)
+
+
+def _urlopen(req, timeout):
+    return _OPENER.open(req, timeout=timeout)
 
 
 class ExpiredSession(RuntimeError):
@@ -67,7 +84,7 @@ class Drive:
     def _req(self, url, data=None, headers=None, method=None):
         h = {"Cookie": self.cookie, "User-Agent": self.s.get("ua") or "Mozilla/5.0"}
         h.update(headers or {})
-        return ur.urlopen(ur.Request(url, data=data, headers=h, method=method), timeout=60)
+        return _urlopen(ur.Request(url, data=data, headers=h, method=method), 60)
 
     def _rnd(self):
         return f"rnd={int(time.time()*1000)}_{random.randint(0, 9999)}&webagent=v2"
@@ -244,7 +261,7 @@ def _call(url, fields=None, cookie="", get=False):
     else:
         h["Content-Type"] = "application/x-www-form-urlencoded"
         req = ur.Request(url, up.urlencode(fields).encode(), h)
-    d = json.loads(ur.urlopen(req, timeout=30).read())
+    d = json.loads(_urlopen(req, 30).read())
     if str(d.get("code")) != "200":
         raise RuntimeError(d.get("msg") or d.get("message") or str(d))
     return d.get("data") or {}
@@ -690,27 +707,56 @@ def resolve_stream(d, path):
     if str(r.get("code")) != "200":
         raise ExpiredSession(f"play refused: {r.get('code')} {r.get('msg')}")
     data = r["data"]
-    uri = data["uri"]
-    return {"url": d.host + up.quote(uri, safe="/:?&=%+~,"), "kind": kind, "duration": data.get("duration"),
-            "title": os.path.basename(path)}
+    url = hls_proxy_url(data["uri"])
+    if not url:
+        raise RuntimeError("could not start the local media proxy")
+    return {"url": url, "kind": kind, "duration": data.get("duration"), "title": os.path.basename(path)}
 
 
-def mpv_conf(d):
-    """mpv config holding the session cookie, mode 0600, so it never shows up in `ps`."""
-    hdr = "Cookie: " + d.cookie
-    if "," in hdr:  # mpv splits this option on commas
-        raise RuntimeError("cookie contains a comma; cannot pass it to mpv")
-    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "unifydrive-mpv.conf")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(f"http-header-fields={hdr}\n")
-        extra = os.path.expanduser("~/.config/unifydrive/mpv-extra.conf")  # optional user mpv options, one per line
-        if os.path.exists(extra):
-            f.write(open(extra).read() + "\n")
-    return path
+# mpv never gets the NAS session cookie. Every network stream it opens is a localhost proxy URL (range proxy for video,
+# the audio proxy for music and for the HLS transcodes), and the proxy adds the cookie itself, only on requests to the
+# NAS. (mpv's http-header-fields go to EVERY host it contacts, so a contributed file that mpv reads as a playlist could
+# otherwise send the cookie to any server.) The proxy URLs carry a bearer token, so they reach mpv through a 0600 file
+# in a private directory, never on the command line where other local accounts can read them in `ps`.
+MPV_NET = ["--ytdl=no", "--load-unsafe-playlists=no"]
 
 
-def play(d, path, extra_args=(), url=None):
+def _private_dir(name):
+    """A directory of ours (mode 0700, not a symlink) under the runtime dir, for files holding bearer URLs."""
+    p = os.path.join(_runtime(), name)
+    os.makedirs(p, mode=0o700, exist_ok=True)
+    st = os.lstat(p)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise RuntimeError(f"refusing to use {p}: not a private directory of this user")
+    return p
+
+
+def _url_file(url, name):
+    """A 0600 playlist holding one stream URL, so the URL is not in mpv's argv."""
+    if "\n" in url or "\r" in url:
+        raise RuntimeError("bad stream URL")
+    f = os.path.join(_private_dir("unifydrive-play"), name + ".m3u")
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write("#EXTM3U\n" + url + "\n")
+    return f
+
+
+def _is_proxy_url(url):
+    return url.startswith("http://127.0.0.1:")
+
+
+def mpv_conf(d=None):
+    """mpv options for NAS playback: the user's optional extra config. (Holds no secrets.)"""
+    try:   # earlier versions left the session cookie here
+        os.remove(os.path.join(_runtime(), "unifydrive-mpv.conf"))
+    except OSError:
+        pass
+    extra = os.path.expanduser("~/.config/unifydrive/mpv-extra.conf")  # optional user mpv options, one per line
+    return [*MPV_NET, *([f"--include={extra}"] if os.path.exists(extra) else [])]
+
+
+def play(d, path, extra_args=(), url=None, url_name=None):
     local = video_local(path) if _kind(path) == "video" else None
     if local:                                            # saved for offline: plain file, no network, no cookie
         info = {"url": local[0], "kind": "video", "duration": None, "title": os.path.basename(path)}
@@ -718,16 +764,17 @@ def play(d, path, extra_args=(), url=None):
                f"--force-media-title={os.path.splitext(info['title'])[0]}", "--slang=en,eng,english",
                *[f"--sub-file={x}" for x in local[1]], *extra_args, local[0]]
         return info, cmd
-    info = resolve_stream(d, path)
-    if url:
-        info["url"] = url
+    info = resolve_stream(d, path) if not url else {"url": url, "kind": _kind(path), "duration": None,
+                                                     "title": os.path.basename(path)}
+    if not _is_proxy_url(info["url"]):
+        raise RuntimeError("refusing to hand mpv a stream that needs the NAS session")
     cmd = ["mpv", "--force-window=yes", "--keep-open=no", f"--title={info['title']}",
            f"--force-media-title={os.path.splitext(info['title'])[0]}"]
     if info["kind"] == "video":
         # defaults first so ~/.config/unifydrive/mpv-extra.conf (via --include) can override them:
         # show English captions when the file has them, and buffer ahead to ride out bitrate peaks on the relay
         cmd += ["--slang=en,eng,english", "--cache=yes", "--demuxer-max-bytes=200MiB", "--demuxer-readahead-secs=90"]
-    cmd += [f"--include={mpv_conf(d)}", *extra_args, info["url"]]
+    cmd += [*mpv_conf(), *extra_args, _url_file(info["url"], url_name or info["kind"] or "media")]
     if info["kind"] == "audio":
         cmd.insert(1, "--no-video")
     return info, cmd
@@ -898,7 +945,9 @@ def _track_file(d, url, meta, idx):
     if cover and not os.path.exists(link):
         shutil.copyfile(cover, link)
     f = os.path.join(dp, f"{idx:04d}.edl")
-    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # holds a session-bearing stream URL
+    if not _is_proxy_url(url):
+        raise RuntimeError("refusing to hand mpv a stream that needs the NAS session")
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # holds a proxy URL with its bearer token
     with os.fdopen(fd, "w") as fh:
         fh.write("# mpv EDL v0\n" + _edl_body(url, meta) + "\n")
     return f
@@ -964,7 +1013,7 @@ def play_album(d, album_id, start=0, name="", cover=""):
                    for x in tracks], f)
     first = resolve_stream(d, tracks[0]["path"])
     cmd = ["mpv", "--no-video", "--idle=no", "--force-window=no", f"--input-ipc-server={SOCK}",
-           f"--include={mpv_conf(d)}", "--title=UnifyDrive Music", _track_file(d, first["url"], tracks[0], 0)]
+           *mpv_conf(), "--title=UnifyDrive Music", _track_file(d, first["url"], tracks[0], 0)]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     for _ in range(50):
         if os.path.exists(SOCK):
@@ -1497,10 +1546,15 @@ def comic_index(d, path, size):
     return infos
 
 
+PAGE_MAX = 256 << 20
+
+
 def comic_member(d, path, size, info):
     """One page: a single ranged request for its local header + data, then inflate and check the CRC."""
     if info.flag_bits & 1:
         raise RuntimeError("encrypted archive")
+    if info.compress_size > PAGE_MAX or info.file_size > PAGE_MAX:   # sizes come from the archive: bound memory (zip bomb)
+        raise RuntimeError("page too large")
     o = info.header_offset
     buf = d.read_range(path, o, o + 30 + 4096 + info.compress_size, size)
     if buf[:4] != b"PK\x03\x04":
@@ -1513,7 +1567,10 @@ def comic_member(d, path, size, info):
     if info.compress_type == 0:
         out = raw
     elif info.compress_type == 8:
-        out = zlib.decompress(raw, -15)
+        inflater = zlib.decompressobj(-15)
+        out = inflater.decompress(raw, info.file_size + 1)
+        if len(out) > info.file_size or inflater.unconsumed_tail:
+            raise RuntimeError("page is larger than its header says")
     else:
         raise RuntimeError(f"unsupported zip compression {info.compress_type}")
     if zlib.crc32(out) & 0xFFFFFFFF != info.CRC:
@@ -1654,8 +1711,9 @@ def _fetch_rar(d, path, size, dp):
         found = []
         for root, _, files in os.walk(tmp):
             for fn in files:
-                if fn.lower().endswith(IMG_EXT):
-                    found.append(os.path.join(root, fn))
+                fp = os.path.join(root, fn)
+                if fn.lower().endswith(IMG_EXT) and not os.path.islink(fp):   # an archive can carry a symlink named 0001.jpg
+                    found.append(fp)
         if not found:
             _emit({"error": "no pages found in this archive" + (": " + r.stderr.decode()[:120] if r.returncode else "")})
             return
@@ -2086,7 +2144,7 @@ def range_server(d, path, size, name):
                 self.end_headers()
                 return
             self.send_response(206 if ranged else 200)
-            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Type", _ctype(name))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(b - a + 1))
             if ranged:
@@ -2131,6 +2189,12 @@ def range_server(d, path, size, name):
     return f"http://127.0.0.1:{srv.server_address[1]}/{token}/{up.quote(name)}"
 
 
+def _ctype(name):
+    """The file's real media type: mpv decides from it (among other things) whether a stream is a playlist."""
+    t = mimetypes.guess_type(name)[0] or ""
+    return t if t.startswith(("audio/", "video/")) else "application/octet-stream"
+
+
 # --------------------------------------------------------------------------
 # Music: the original file through a local range proxy (a FLAC stays a FLAC)
 # --------------------------------------------------------------------------
@@ -2138,7 +2202,8 @@ def range_server(d, path, size, name):
 # served the way video's is: the relay answers open-ended Range requests with 200, which breaks seeking, so a
 # localhost daemon turns them into proper 206s and reads ahead over several connections. One daemon serves every
 # track of every album and exits after UD_AUDIO_PROXY_IDLE seconds (default 30 min) with nothing playing.
-# UD_AUDIO_TRANSCODE=1 brings the old behaviour back, and any failure to start the daemon falls back to it.
+# UD_AUDIO_TRANSCODE=1 brings the old behaviour back (the HLS stream, also through this daemon: mpv never holds the
+# NAS cookie), so if the daemon cannot start, music cannot play.
 AUDIO_PROXY_STATE = os.path.join(_runtime(), "unifydrive-audio-proxy.json")
 
 
@@ -2179,6 +2244,8 @@ def audio_proxy():
                     st["last"] = time.time()
 
         def _serve_one(self, body):
+            if up.urlsplit(self.path).path.startswith(f"/{token}~nas/"):
+                return self._nas(body)
             m = re.match(r"^/%s(/.+)$" % re.escape(token), up.urlsplit(self.path).path)
             remote = up.unquote(m.group(1)) if m else ""
             if not remote.startswith("/") or ".." in remote.split("/") or remote.lower().rsplit(".", 1)[-1] not in AUDIO_EXT:
@@ -2206,7 +2273,7 @@ def audio_proxy():
                 self.end_headers()
                 return
             self.send_response(206 if ranged else 200)
-            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Type", _ctype(remote))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(b - a + 1))
             if ranged:
@@ -2236,6 +2303,54 @@ def audio_proxy():
             finally:
                 for f in futs:
                     f.cancel()
+
+        def _nas(self, body):
+            """The server's HLS transcode (UD_*_TRANSCODE=1, or the fallback): forward to the NAS with the cookie.
+            Only GETs under /splay/ or /transcode/; playlists are rewritten so every URI in them comes back here."""
+            u = up.urlsplit(self.path)
+            rpath = u.path[len(f"/{token}~nas"):]
+            if not rpath.startswith(HLS_PREFIX) or ".." in up.unquote(rpath).split("/"):
+                self.send_error(404)
+                return
+            hdrs = {"Range": self.headers["Range"]} if self.headers.get("Range") else {}
+            try:
+                r = _resilient(d, d._req, d.host + rpath + (f"?{u.query}" if u.query else ""), None, hdrs)
+            except urllib.error.HTTPError as e:
+                self.send_error(e.code if 400 <= e.code < 600 else 502)
+                return
+            except Exception:
+                self.send_error(502)
+                return
+            with r:
+                ctype = r.headers.get("Content-Type") or "application/octet-stream"
+                if "mpegurl" in ctype.lower() or rpath.lower().endswith(".m3u8"):
+                    data = _hls_rewrite(r.read().decode("utf8", "replace"), d.host, rpath, f"/{token}~nas").encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    if body:
+                        self.wfile.write(data)
+                    return
+                self.send_response(r.status)
+                for k in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                    if r.headers.get(k):
+                        self.send_header(k, r.headers[k])
+                if not r.headers.get("Content-Length"):
+                    self.close_connection = True
+                self.end_headers()
+                if not body:
+                    return
+                try:
+                    while True:
+                        b = r.read(1 << 16)
+                        if not b:
+                            break
+                        self.wfile.write(b)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                except Exception:
+                    self.close_connection = True
 
         def do_GET(self):
             self._serve(True)
@@ -2287,6 +2402,50 @@ def _audio_proxy_ensure():
         with os.fdopen(fd, "w") as f:
             json.dump(st, f)
         return st
+
+
+# Where the NAS serves its transcode streams: the play endpoints answer with a /splay/ URI (verified on a UT2); /transcode/ is kept for older firmware.
+HLS_PREFIX = ("/transcode/", "/splay/")
+
+
+def _hls_rewrite(text, host, base, prefix):
+    """Point every URI of an HLS playlist (lines and URI="..." attributes) at `prefix` + its path on the NAS. A URI
+    that is not on the NAS is dropped: nothing in a playlist can send mpv anywhere but back to this proxy."""
+    def fix(u):
+        a = up.urljoin(host + base, u.strip())
+        return prefix + a[len(host):] if a.startswith(host + "/") else None
+
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            bad = []
+
+            def attr(m):
+                v = fix(m.group(1))
+                if v is None:
+                    bad.append(1)
+                return f'URI="{v}"'
+            line = re.sub(r'URI="([^"]*)"', attr, line)
+            if bad or re.search(r'URI=(?!")', line, re.I):
+                continue
+        elif s:
+            line = fix(s)
+            if line is None:
+                continue
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def hls_proxy_url(uri):
+    """The audio proxy's URL for a transcode stream the NAS returned (a path under /splay/ or /transcode/), or None."""
+    if not uri.startswith(HLS_PREFIX):
+        raise RuntimeError(f"unexpected transcode stream location: {uri[:60]}")
+    try:
+        st = _audio_proxy_ensure()
+    except Exception:
+        return None
+    return f"http://127.0.0.1:{st['port']}/{st['token']}~nas{up.quote(uri, safe='/:?&=%+~,')}" if st else None
 
 
 def audio_direct_url(path):
@@ -2436,7 +2595,8 @@ def vplay(d, path, extra):
     else:
         size = d.run(file_size, d, path)
         url = range_server(d, path, size, os.path.basename(path))
-    info, cmd = play(None, path, extra, url) if local else d.run(play, d, path, extra, url)
+    me = os.getpid()
+    info, cmd = play(None, path, extra, url) if local else d.run(play, d, path, extra, url, f"video-{me}")
     try:                                        # one video player at a time
         _ipc(["quit"], 1, VSOCK)
         time.sleep(0.4)
@@ -2444,7 +2604,6 @@ def vplay(d, path, extra):
         pass
     if os.path.exists(VSOCK):
         os.unlink(VSOCK)
-    me = os.getpid()
     vqueue_write(me, queue)                     # a manual play without a queue also clears the old one
     cmd.insert(1, f"--input-ipc-server={VSOCK}")
     cmd = ["--keep-open=yes" if x == "--keep-open=no" else x for x in cmd]   # stay on the last frame so the end is seen over IPC
@@ -2461,6 +2620,11 @@ def vplay(d, path, extra):
     if d and not local:
         threading.Thread(target=_load_subs, args=(d, path, VSOCK), daemon=True).start()
     ended = _watch_video(path, VSOCK, pr)
+    if not local:
+        try:
+            os.remove(os.path.join(_runtime(), "unifydrive-play", f"video-{me}.m3u"))
+        except OSError:
+            pass
     shutil.rmtree(os.path.join(SUB_DIR, hashlib.sha1(path.encode()).hexdigest()[:12]), ignore_errors=True)
     _autoplay_next(me, ended)
 
@@ -3109,11 +3273,13 @@ def main(a):
             sys.exit(1)
         print(line)
         return
-    if cmd in ("stream-url", "play"):
-        info, argv = d.run(play, d, a[1], a[2:] if cmd == "play" else ())
-        if cmd == "play":
-            subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            info.pop("url")
+    if cmd == "stream-url":
+        print(json.dumps(d.run(resolve_stream, d, a[1])))
+        return
+    if cmd == "play":
+        info, argv = d.run(play, d, a[1], a[2:])
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        info.pop("url")
         print(json.dumps(info))
         return
     if cmd == "upload":
