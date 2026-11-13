@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "eg.unifydrive",
   "name": "UnifyDrive",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "author": "eg",
   "license": "MIT",
   "description": "Browse, upload and download files, stream music and video, read comics, browse photos, sync folders, share links, NAS transfers/apps/health alerts, quick capture, autoplay, and save albums/chapters/videos offline on a UnifyDrive UT2 via the ud.link web API.",

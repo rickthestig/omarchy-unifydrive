@@ -31,7 +31,7 @@ omarchy plugin remove eg.unifydrive --yes
 ## What it does
 
 - **Files**: browse, upload (files, folders, drag and drop), download, delete to the recycle bin, share links (copied with the password).
-- **Music**: albums, offline albums, mini-player. Plays the original files (a FLAC stays FLAC) through a small local proxy; `UD_AUDIO_TRANSCODE=1` goes back to the server's lossy HLS stream.
+- **Music**: albums, offline albums, mini-player. Plays the original files (a FLAC stays FLAC) through a small local proxy; `UD_AUDIO_TRANSCODE=1` goes back to the server's lossy HLS stream (also proxied). mpv never receives the NAS session cookie: every stream it opens is a localhost proxy URL, handed over in a private 0600 file rather than on the command line.
 - **Video**: libraries, resume, subtitles, autoplay next episode, offline videos (mpv).
 - **Comics**: a reader window, per-series progress, preloading of the next chapters, offline chapters.
 - **Photos**: timeline viewer with slideshow; optional live upload of a local photo folder.
