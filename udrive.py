@@ -45,6 +45,23 @@ SESSION = os.path.expanduser("~/.config/unifydrive/session.json")
 CHUNK = 2 * 1024 * 1024
 
 
+class _SameOriginRedirect(ur.HTTPRedirectHandler):
+    """The NAS session cookie is an ordinary request header, and urllib re-sends those on a redirect to ANY host (and
+    from https to http). Follow redirects only within the same origin; the API never needs a cross-origin one."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        a, b = up.urlsplit(req.full_url), up.urlsplit(up.urljoin(req.full_url, newurl))
+        if (a.scheme, a.netloc.lower()) != (b.scheme, b.netloc.lower()):
+            raise urllib.error.HTTPError(req.full_url, code, "cross-origin redirect refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = ur.build_opener(_SameOriginRedirect)
+
+
+def _urlopen(req, timeout):
+    return _OPENER.open(req, timeout=timeout)
+
+
 class ExpiredSession(RuntimeError):
     pass
 
@@ -67,7 +84,7 @@ class Drive:
     def _req(self, url, data=None, headers=None, method=None):
         h = {"Cookie": self.cookie, "User-Agent": self.s.get("ua") or "Mozilla/5.0"}
         h.update(headers or {})
-        return ur.urlopen(ur.Request(url, data=data, headers=h, method=method), timeout=60)
+        return _urlopen(ur.Request(url, data=data, headers=h, method=method), 60)
 
     def _rnd(self):
         return f"rnd={int(time.time()*1000)}_{random.randint(0, 9999)}&webagent=v2"
@@ -244,7 +261,7 @@ def _call(url, fields=None, cookie="", get=False):
     else:
         h["Content-Type"] = "application/x-www-form-urlencoded"
         req = ur.Request(url, up.urlencode(fields).encode(), h)
-    d = json.loads(ur.urlopen(req, timeout=30).read())
+    d = json.loads(_urlopen(req, 30).read())
     if str(d.get("code")) != "200":
         raise RuntimeError(d.get("msg") or d.get("message") or str(d))
     return d.get("data") or {}
@@ -1529,10 +1546,15 @@ def comic_index(d, path, size):
     return infos
 
 
+PAGE_MAX = 256 << 20
+
+
 def comic_member(d, path, size, info):
     """One page: a single ranged request for its local header + data, then inflate and check the CRC."""
     if info.flag_bits & 1:
         raise RuntimeError("encrypted archive")
+    if info.compress_size > PAGE_MAX or info.file_size > PAGE_MAX:   # sizes come from the archive: bound memory (zip bomb)
+        raise RuntimeError("page too large")
     o = info.header_offset
     buf = d.read_range(path, o, o + 30 + 4096 + info.compress_size, size)
     if buf[:4] != b"PK\x03\x04":
@@ -1545,7 +1567,10 @@ def comic_member(d, path, size, info):
     if info.compress_type == 0:
         out = raw
     elif info.compress_type == 8:
-        out = zlib.decompress(raw, -15)
+        inflater = zlib.decompressobj(-15)
+        out = inflater.decompress(raw, info.file_size + 1)
+        if len(out) > info.file_size or inflater.unconsumed_tail:
+            raise RuntimeError("page is larger than its header says")
     else:
         raise RuntimeError(f"unsupported zip compression {info.compress_type}")
     if zlib.crc32(out) & 0xFFFFFFFF != info.CRC:
@@ -1686,8 +1711,9 @@ def _fetch_rar(d, path, size, dp):
         found = []
         for root, _, files in os.walk(tmp):
             for fn in files:
-                if fn.lower().endswith(IMG_EXT):
-                    found.append(os.path.join(root, fn))
+                fp = os.path.join(root, fn)
+                if fn.lower().endswith(IMG_EXT) and not os.path.islink(fp):   # an archive can carry a symlink named 0001.jpg
+                    found.append(fp)
         if not found:
             _emit({"error": "no pages found in this archive" + (": " + r.stderr.decode()[:120] if r.returncode else "")})
             return
@@ -2280,7 +2306,7 @@ def audio_proxy():
 
         def _nas(self, body):
             """The server's HLS transcode (UD_*_TRANSCODE=1, or the fallback): forward to the NAS with the cookie.
-            Only GETs under /transcode/; playlists are rewritten so every URI in them comes back here."""
+            Only GETs under /splay/ or /transcode/; playlists are rewritten so every URI in them comes back here."""
             u = up.urlsplit(self.path)
             rpath = u.path[len(f"/{token}~nas"):]
             if not rpath.startswith(HLS_PREFIX) or ".." in up.unquote(rpath).split("/"):
@@ -2378,7 +2404,8 @@ def _audio_proxy_ensure():
         return st
 
 
-HLS_PREFIX = "/transcode/"
+# Where the NAS serves its transcode streams: the play endpoints answer with a /splay/ URI (verified on a UT2); /transcode/ is kept for older firmware.
+HLS_PREFIX = ("/transcode/", "/splay/")
 
 
 def _hls_rewrite(text, host, base, prefix):
@@ -2411,7 +2438,7 @@ def _hls_rewrite(text, host, base, prefix):
 
 
 def hls_proxy_url(uri):
-    """The audio proxy's URL for a transcode stream the NAS returned (a path under /transcode/), or None."""
+    """The audio proxy's URL for a transcode stream the NAS returned (a path under /splay/ or /transcode/), or None."""
     if not uri.startswith(HLS_PREFIX):
         raise RuntimeError(f"unexpected transcode stream location: {uri[:60]}")
     try:

@@ -218,7 +218,7 @@ ShellRoot {
         sourceSize.height: Math.round(height * Screen.devicePixelRatio)
       }
 
-      Text {
+      Text { textFormat: Text.PlainText;
         anchors.centerIn: parent
         visible: app.shown === "" || img.status === Image.Loading
         horizontalAlignment: Text.AlignHCenter
@@ -231,7 +231,7 @@ ShellRoot {
         anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
         height: 34
         color: "#c8000000"
-        Text {
+        Text { textFormat: Text.PlainText;
           anchors.left: parent.left; anchors.leftMargin: 14; anchors.verticalCenter: parent.verticalCenter
           anchors.right: hint.left; anchors.rightMargin: 14
           elide: Text.ElideRight

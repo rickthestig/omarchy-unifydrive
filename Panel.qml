@@ -1551,7 +1551,7 @@ Panel {
                 anchors.fill: parent; radius: Style.space(13)
                 color: root.vlib === modelData.id ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
               }
-              Text {
+              Text { textFormat: Text.PlainText;
                 anchors.centerIn: parent; text: modelData.name; elide: Text.ElideRight; width: parent.width - Style.space(8); horizontalAlignment: Text.AlignHCenter
                 color: root.vlib === modelData.id ? root.foreground : root.dim
                 font.family: root.fontFamily; font.pixelSize: Style.font.caption
