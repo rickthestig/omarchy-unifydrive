@@ -3142,7 +3142,7 @@ def capture(d, mode="region", link=None):
     else:
         text = rpath
     try:
-        subprocess.run(["wl-copy", text], timeout=5)
+        subprocess.run(["wl-copy"], input=text, text=True, timeout=5)   # stdin, never argv: the text can hold a share password
     except (OSError, subprocess.SubprocessError):
         pass
     try:
@@ -3154,7 +3154,19 @@ def capture(d, mode="region", link=None):
 
 
 
+def _lock_dirs():
+    """Keep everything cached or saved from the NAS private: the top folders are 0700, so files below them
+    are unreachable to other local accounts whatever umask created them."""
+    for d in (os.path.dirname(SESSION), CACHE, COMIC_CACHE, os.path.dirname(OFFLINE_DIR)):
+        try:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+
+
 def main(a):
+    _lock_dirs()
     cmd = a[0] if a else ""
     if cmd == "login":
         try:

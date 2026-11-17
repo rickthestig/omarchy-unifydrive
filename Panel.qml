@@ -152,7 +152,15 @@ Panel {
     if (t.updated > 0) p.push(new Date(t.updated * 1000).toLocaleString(Qt.locale(), "d MMM HH:mm"))
     return p.join("  ·  ")
   }
-  function copyText(text) { Quickshell.execDetached(["wl-copy", text]) }
+  // The text goes to wl-copy on stdin, never as an argument: it can hold a share password, and argv is visible to other accounts.
+  function copyText(text) { clipProc.running = false; clipProc.text = text; clipProc.stdinEnabled = true; clipProc.running = true }
+  Process {
+    id: clipProc
+    property string text: ""
+    command: ["wl-copy"]
+    stdinEnabled: true
+    onStarted: { write(text); stdinEnabled = false }
+  }
   function shareEntry(entry) {
     if (shareMakeProc.running) return
     status = "Creating share link…"; failed = false
