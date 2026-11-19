@@ -1462,7 +1462,10 @@ READER_LOG = os.path.join(_runtime(), "unifydrive-reader.log")
 
 
 def _natkey(s):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+    """Natural sort key. Only the runs the split captured (the odd positions, plain ASCII digits) become numbers:
+    a name with a circled or superscript digit, or a 5000-digit run, must sort, not raise."""
+    parts = re.split(r"([0-9]+)", s)
+    return [int(t) if i % 2 and len(t) < 4000 else t.lower() for i, t in enumerate(parts)]
 
 
 class RemoteFile(io.RawIOBase):
@@ -2154,7 +2157,7 @@ def range_server(d, path, size, name):
                 self.send_error(404)
                 return
             a, b, ranged = 0, size - 1, False
-            m = re.match(r"bytes=(\d*)-(\d*)$", (self.headers.get("Range") or "").strip())
+            m = re.match(r"bytes=(\d{0,15})-(\d{0,15})$", (self.headers.get("Range") or "").strip())
             if m:
                 ranged = True
                 lo, hi = m.groups()
@@ -2283,7 +2286,7 @@ def audio_proxy():
                 self.send_error(502)
                 return
             a, b, ranged = 0, size - 1, False
-            mr = re.match(r"bytes=(\d*)-(\d*)$", (self.headers.get("Range") or "").strip())
+            mr = re.match(r"bytes=(\d{0,15})-(\d{0,15})$", (self.headers.get("Range") or "").strip())
             if mr:
                 ranged = True
                 lo, hi = mr.groups()
@@ -2438,7 +2441,10 @@ def _hls_rewrite(text, host, base, prefix):
     """Point every URI of an HLS playlist (lines and URI="..." attributes) at `prefix` + its path on the NAS. A URI
     that is not on the NAS is dropped: nothing in a playlist can send mpv anywhere but back to this proxy."""
     def fix(u):
-        a = up.urljoin(host + base, u.strip())
+        try:
+            a = up.urljoin(host + base, u.strip())
+        except ValueError:          # e.g. "http://[x": urljoin refuses it; a URI we cannot parse is dropped like a foreign one
+            return None
         return prefix + a[len(host):] if a.startswith(host + "/") else None
 
     out = []
