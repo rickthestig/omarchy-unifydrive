@@ -154,6 +154,8 @@ class Drive:
     def get(self, path, dest_dir="."):
         r = self._req(self._download_url(path))
         name = os.path.basename(path)
+        if name in ("", ".", ".."):
+            raise RuntimeError("refusing to save a file with the name " + repr(name))
         out = os.path.join(dest_dir, name)
         if "json" in (r.headers.get("Content-Type") or ""):
             raise RuntimeError("download failed: " + r.read()[:200].decode("utf8", "replace"))
@@ -2000,13 +2002,35 @@ def comic_unpin(series):
 # --------------------------------------------------------------------------
 # Albums saved for offline listening
 # --------------------------------------------------------------------------
+MUSIC_OFFLINE = os.path.join(OFFLINE_DIR, "music")
+
+
 def album_dir(album_id):
-    return os.path.join(OFFLINE_DIR, "music", re.sub(r"[^A-Za-z0-9_.-]", "_", album_id))
+    """The folder of one saved album. The id comes from the NAS, so it is never used as a path as it is: an id that is
+    not plainly alphanumeric (such as "." or "..", or anything with a slash) maps to a hashed name instead, so
+    it can never point at the offline folder itself, its parent or anything outside it."""
+    aid = str(album_id)
+    if re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}", aid) and ".." not in aid:
+        name = aid
+    else:
+        name = "x-" + hashlib.sha1(aid.encode("utf8", "replace")).hexdigest()[:24]
+    return os.path.join(MUSIC_OFFLINE, name)
+
+
+def _inside_music_offline(path):
+    """True only for a real (non-symlink) folder directly below the offline music folder."""
+    try:
+        return (not os.path.islink(path) and os.path.isdir(path)
+                and os.path.realpath(os.path.dirname(path)) == os.path.realpath(MUSIC_OFFLINE)
+                and os.path.basename(path) not in ("", ".", ".."))
+    except OSError:
+        return False
 
 
 def album_pin(d, album_id, name="", cover=""):
     if not album_id:
         raise RuntimeError("no album id")
+    album_id = str(album_id)
     tracks = songs(d, album_id)
     if not tracks:
         raise RuntimeError("album has no songs")
@@ -2036,7 +2060,9 @@ def album_pin(d, album_id, name="", cover=""):
 
 
 def album_unpin(album_id):
-    shutil.rmtree(album_dir(album_id), ignore_errors=True)
+    dd = album_dir(album_id)
+    if _inside_music_offline(dd):
+        shutil.rmtree(dd, ignore_errors=True)
     pins = _pins()
     pins["albums"].pop(album_id, None)
     _save_pins(pins)
